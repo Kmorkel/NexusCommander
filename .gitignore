@@ -1,0 +1,27 @@
+
+# Build output
+build/
+build-*/
+*.o
+*.obj
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+
+# Qt Creator user-specific
+*.user
+*.user.*
+.qtcreator/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
