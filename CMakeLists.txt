@@ -142,34 +142,45 @@ set_target_properties(NexusCommander PROPERTIES
     WIN32_EXECUTABLE TRUE
 )
 
-# ── Windows: Deploy Qt DLLs into a separate deploy/ folder ───────────────────
-# Works with both MSVC and MinGW — windeployqt auto-detects the runtime from
-# the exe format, as long as we call the windeployqt that ships with the
-# matching Qt build (ensured via the HINTS path below).
-#
-# Debug builds skip deployment: Qt 6.10 MinGW ships without debug plugins
-# (qwindowsd.dll missing), which makes `windeployqt --debug` fail and breaks
-# the build — and therefore debugging from Qt Creator. For debugging the IDE
-# sets up PATH itself, so a deploy/ folder is not needed.
-if(WIN32 AND (MSVC OR MINGW) AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+# ── Windows: Locate windeployqt once, deploy per toolchain ───────────────────
+if(WIN32 AND (MSVC OR MINGW))
     find_program(WINDEPLOYQT windeployqt
         HINTS "${CMAKE_PREFIX_PATH}/bin"
     )
-    if(WINDEPLOYQT)
-        set(DEPLOY_DIR "${CMAKE_BINARY_DIR}/deploy")
-        add_custom_command(TARGET NexusCommander POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E make_directory "${DEPLOY_DIR}"
-            COMMAND ${CMAKE_COMMAND} -E copy
-                    $<TARGET_FILE:NexusCommander> "${DEPLOY_DIR}/"
-            COMMAND ${WINDEPLOYQT}
-                    --release
-                    --dir "${DEPLOY_DIR}"
-                    "${DEPLOY_DIR}/$<TARGET_FILE_NAME:NexusCommander>"
-            COMMENT "Deploying Qt DLLs to ${DEPLOY_DIR}..."
-        )
-    else()
+    if(NOT WINDEPLOYQT)
         message(WARNING "windeployqt not found – DLLs must be copied manually")
     endif()
+endif()
+
+# MSVC: Deploy Qt DLLs directly next to the .exe — for both Debug and Release.
+# Visual Studio is a multi-config generator, so --debug/--release is selected
+# via generator expression. MSVC ships proper debug Qt DLLs (Qt6Cored.dll etc.),
+# so deploying inline lets us debug straight from VS without PATH workarounds.
+if(WIN32 AND MSVC AND WINDEPLOYQT)
+    add_custom_command(TARGET NexusCommander POST_BUILD
+        COMMAND ${WINDEPLOYQT}
+                $<IF:$<CONFIG:Debug>,--debug,--release>
+                "$<TARGET_FILE:NexusCommander>"
+        COMMENT "Deploying Qt DLLs next to $<TARGET_FILE_NAME:NexusCommander>..."
+    )
+endif()
+
+# MinGW: Deploy into a separate deploy/ folder for Release only.
+# Qt 6.10 MinGW ships without debug plugins (qwindowsd.dll missing), so
+# `windeployqt --debug` fails. For debugging Qt Creator sets PATH itself,
+# so no deploy/ folder is needed.
+if(WIN32 AND MINGW AND WINDEPLOYQT AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(DEPLOY_DIR "${CMAKE_BINARY_DIR}/deploy")
+    add_custom_command(TARGET NexusCommander POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${DEPLOY_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy
+                $<TARGET_FILE:NexusCommander> "${DEPLOY_DIR}/"
+        COMMAND ${WINDEPLOYQT}
+                --release
+                --dir "${DEPLOY_DIR}"
+                "${DEPLOY_DIR}/$<TARGET_FILE_NAME:NexusCommander>"
+        COMMENT "Deploying Qt DLLs to ${DEPLOY_DIR}..."
+    )
 endif()
 
 include(GNUInstallDirs)
@@ -182,3 +193,6 @@ install(TARGETS NexusCommander
 if(QT_VERSION_MAJOR EQUAL 6)
     qt_finalize_executable(NexusCommander)
 endif()
+
+# Visual Studio: set NexusCommander as default startup project instead of ALL_BUILD
+set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT NexusCommander)
