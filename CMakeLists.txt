@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(NexusCommander VERSION 0.1 LANGUAGES CXX)
+project(NexusCommander VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTOMOC ON)
@@ -90,8 +90,8 @@ if(WIN32 AND NOT CMAKE_PREFIX_PATH)
 endif()
 # ──────────────────────────────────────────────────────────────────────────────
 
-find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets LinguistTools)
-find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets LinguistTools)
+find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets Concurrent Network LinguistTools)
+find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets Concurrent Network LinguistTools)
 
 set(TS_FILES NexusCommander_en_150.ts)
 
@@ -108,11 +108,18 @@ if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
         MANUAL_FINALIZATION
         ${PROJECT_SOURCES}
         filePanel.h         filePanel.cpp
+        connectServerDialog.h connectServerDialog.cpp
+        fileSystemUtils.h
         fileJob.h
         fileWorkerThread.h  fileWorkerThread.cpp
         jobModel.h          jobModel.cpp
         jobQueueWidget.h    jobQueueWidget.cpp
         clipboardUtils.h    clipboardUtils.cpp
+        driveScanner.h      driveScanner.cpp
+        networkDiscovery.h  networkDiscovery.cpp
+        folderSizeCache.h   folderSizeCache.cpp
+        taskbarProgress.h   taskbarProgress.cpp
+        resources/resources.qrc
     )
     qt_create_translation(QM_FILES ${CMAKE_SOURCE_DIR} ${TS_FILES})
 else()
@@ -128,7 +135,31 @@ else()
     qt5_create_translation(QM_FILES ${CMAKE_SOURCE_DIR} ${TS_FILES})
 endif()
 
-target_link_libraries(NexusCommander PRIVATE Qt${QT_VERSION_MAJOR}::Widgets)
+target_link_libraries(NexusCommander PRIVATE
+    Qt${QT_VERSION_MAJOR}::Widgets
+    Qt${QT_VERSION_MAJOR}::Concurrent
+    Qt${QT_VERSION_MAJOR}::Network
+)
+
+# Single source of the app version: project(VERSION) above → APP_VERSION
+# (main.cpp sets it as applicationVersion, the About dialog reads that)
+target_compile_definitions(NexusCommander PRIVATE APP_VERSION="${PROJECT_VERSION}")
+
+# Windows: mpr = WNet* API (mapped network drives, driveScanner.cpp),
+#          netapi32 = NetShareEnum (share listing, networkDiscovery.cpp),
+#          credui = sign-in dialog (networkDiscovery.cpp),
+#          ole32 + uuid = ITaskbarList3 (taskbar progress, taskbarProgress.cpp)
+if(WIN32)
+    target_link_libraries(NexusCommander PRIVATE mpr netapi32 credui ole32 uuid)
+endif()
+
+# Windows: app.rc embeds nexuscommander.ico as the .exe icon (Explorer, taskbar).
+# windres (MinGW) does not search the .rc file's own folder for the .ico.
+if(WIN32)
+    target_sources(NexusCommander PRIVATE resources/app.rc)
+    set_source_files_properties(resources/app.rc PROPERTIES
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/resources")
+endif()
 
 if(${QT_VERSION} VERSION_LESS 6.1.0)
   set(BUNDLE_ID_OPTION MACOSX_BUNDLE_GUI_IDENTIFIER com.example.NexusCommander)

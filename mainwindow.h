@@ -3,14 +3,17 @@
 #include <QMainWindow>
 #include <QSplitter>
 #include <QTabWidget>
-#include <QTabBar>
-#include <QToolBar>
 #include <QLabel>
+#include <QProgressBar>
+#include <QToolButton>
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QTimer>
-#include <QStorageInfo>
+#include <QFutureWatcher>
+#include "driveScanner.h"
 #include "filePanel.h"
+#include "folderSizeCache.h"
+#include "networkDiscovery.h"
 #include "jobQueueWidget.h"
 
 QT_BEGIN_NAMESPACE
@@ -36,12 +39,14 @@ public:
     ~MainWindow() override;
 
 signals:
-    /// @brief Emitted by the shared drive-watch timer when mounted volumes change.
-    void driveTopologyChanged();
+    /// @brief Emitted when a background drive scan found a different drive set or state.
+    void drivesChanged(const QList<DriveInfo> &drives);
 
 protected:
     /// @brief Handle MouseThumbButtons and Tab-Key
     bool eventFilter(QObject *obj, QEvent *event) override;
+    /// @brief Warn before quitting while jobs are running or queued.
+    void closeEvent(QCloseEvent *event) override;
 #ifdef _WIN32
     bool nativeEvent(const QByteArray &eventType, void *message, qintptr *result) override;
 #endif
@@ -64,12 +69,26 @@ private slots:
     void onRefreshRequested();
     /// @brief Toggle hidden/system file visibility on all panels.
     void onToggleHiddenFiles(bool visible);
+    /// @brief Hide .part files on all panels — copy / move enqueued from now on leave them out.
+    void onToggleHidePartFiles(bool hide);
+    /// @brief Show / update / hide the job indicator in the status bar.
+    void onJobActivityChanged(int activeJobs, TaskbarProgress::State state, double fraction,
+                              const QString &remaining);
+    /// @brief The queue went idle — the status-bar button shows the outcome for a few seconds.
+    void onBatchFinished(int doneJobs, bool failed);
+    /// @brief Briefly highlight the status-bar button — feedback that F5 / F6 / F8 queued a job.
+    void flashJobStatus();
+    /// @brief Switch the Pause / Resume Queue action's icon and text to @p paused.
+    void updatePauseQueueAction(bool paused);
 
     /// @brief Handle Ctrl+V — detects cut vs. copy via Windows "Preferred DropEffect".
     void onPasteRequested(FilePanel *target);
 
-    void onJobFinished(QUuid jobId, FileJob::Status status, const QString &message);
-    void pollMountedDrives();
+    void onJobFinished(QUuid jobId);
+    /// @brief Publish a finished drive scan to all panels (only if something changed).
+    void onDriveScanFinished();
+    /// @brief Add shares found by NetworkDiscovery to the drive list (kept for the session).
+    void onSharesFound(const QStringList &uncPaths);
 
 private:
     Ui::MainWindow *ui;
@@ -79,15 +98,38 @@ private:
     QTabWidget     *m_rightTabs   = nullptr;
     QSplitter      *m_splitter    = nullptr;
     QLabel         *m_statusLabel = nullptr;
+    // Job indicator on the right of the status bar — visible only while jobs run.
+    QToolButton    *m_jobStatusButton = nullptr;   ///< "2 jobs running — 1:23 left", opens the Job Queue.
+    QProgressBar   *m_jobProgressBar  = nullptr;   ///< Batch progress, like the taskbar button.
+    QTimer         *m_jobFlashTimer   = nullptr;   ///< Ends the highlight after a job was queued.
+    QTimer         *m_jobDoneTimer    = nullptr;   ///< Hides the "✓ N job(s) done" summary.
+
+    // View settings for all tabs, also applied to new ones — per session, never saved.
+    bool            m_showHiddenFiles = false;
+    bool            m_hidePartFiles   = true;    ///< On by default.
 
     // --- Background worker + job queue dialog ---
     FileWorkerThread     *m_worker   = nullptr;
     JobQueueWidget *m_jobQueue = nullptr;
+    TaskbarProgress      *m_taskbarProgress = nullptr;   ///< Job progress on the taskbar button.
 
-    // Single shared timer that polls QStorageInfo every 2 s. Each FilePanel
-    // listens to driveTopologyChanged() and rebuilds its drive bar locally.
-    QTimer      *m_driveWatchTimer = nullptr;
-    QStringList  m_lastDriveRoots;
+    // Drive list is scanned off the GUI thread (DriveScanner::scan). Triggers:
+    // WM_DEVICECHANGE + slow fallback timer (no network probe) and opening a
+    // drive dropdown (with network probe). Panels get the result via drivesChanged().
+    QTimer                          *m_driveWatchTimer   = nullptr;
+    QFutureWatcher<QList<DriveInfo>> *m_driveScanWatcher = nullptr;
+    QList<DriveInfo>                 m_drives;              ///< Last published scan result.
+    bool                             m_driveScanQueued      = false; ///< Rescan requested while one was running.
+    bool                             m_driveScanQueuedProbe = false; ///< Queued rescan should probe network drives.
+
+    // LAN search ("Find network drives…" in the dropdown). Found shares are
+    // remembered for the session only — never saved — and passed to every
+    // scan, so a share that disappears later shows up greyed out.
+    NetworkDiscovery *m_networkDiscovery = nullptr;
+    QStringList       m_knownShares;
+
+    // Folder sizes calculated this session, shared by all tabs — memory only, never saved.
+    FolderSizeCache  *m_folderSizeCache  = nullptr;
 
     // Actions
     QAction *m_newTabAction    = nullptr;
@@ -98,6 +140,8 @@ private:
     QAction *m_deleteAction    = nullptr;
     QAction *m_refreshAction   = nullptr;
     QAction *m_jobQueueAction  = nullptr;
+    QAction *m_pauseQueueAction = nullptr;   ///< Pause / resume the whole queue — icon follows the state.
+    QAction *m_hidePartFilesAction = nullptr;
 
     /// @return The panel (or child of) that currently has keyboard focus.
     FilePanel *activePanel()   const;
@@ -109,10 +153,8 @@ private:
     /// @return The QTabWidget on the opposite side.
     QTabWidget *inactiveSide() const;
 
-    /// @brief Refresh every FilePanel tab inside @p tabs.
-    void refreshFilePanels(QTabWidget *tabs);
-    /// @brief Set hidden-file visibility on every FilePanel in @p tabs.
-    void setHiddenFilesVisibility(QTabWidget *tabs, bool visible);
+    /// @return Every FilePanel tab on both sides.
+    QList<FilePanel *> allPanels() const;
 
     /// @brief Create a new FilePanel tab in @p side, navigated to @p path.
     FilePanel *addTab(QTabWidget *side, const QString &path = QString());
@@ -127,6 +169,8 @@ private:
     void setupMenuBar();
     void setupStatusBar();
     void setupDriveWatcher();
+    /// @brief Start a background drive scan; bursts are collapsed into one follow-up scan.
+    void requestDriveScan(bool probeNetwork);
     void setupCore();
     void setupWindow();
     void setupConnections();
@@ -149,5 +193,6 @@ private:
     bool handleTabKey(QObject *obj, QKeyEvent *event);
     bool handleThumbButtons(QMouseEvent *event);
     bool handleMiddleClick(QObject *obj, QMouseEvent *event);
-    void refreshAffectedTabs(QTabWidget *side, const QStringList &affectedDirs);
+    /// @brief Refresh every tab that shows one of @p affectedDirs.
+    void refreshAffectedTabs(const QStringList &affectedDirs);
 };

@@ -1,6 +1,7 @@
 #include "mainwindow.h"
 #include "./ui_mainwindow.h"
 
+#include <QCloseEvent>
 #include <QDir>
 #include <QSet>
 #include <QMenuBar>
@@ -12,9 +13,14 @@
 #include <QUrl>
 #include <QToolButton>
 #include <QTabBar>
+#include <QToolBar>
 #include <QGridLayout>
 #include <QSpacerItem>
+#include <QStyle>
+#include <QtConcurrent/QtConcurrentRun>
+#include <algorithm>
 #include "clipboardUtils.h"
+#include "fileSystemUtils.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -31,22 +37,29 @@ constexpr int kDriveWatchIntervalMs = 30000;
 constexpr int kDriveWatchIntervalMs = 2000;
 #endif
 
-/// @brief Path comparison casing — Windows is case-insensitive, POSIX is case-sensitive.
-constexpr Qt::CaseSensitivity kPathCase =
-#ifdef Q_OS_WIN
-    Qt::CaseInsensitive;
-#else
-    Qt::CaseSensitive;
-#endif
+// Job indicator in the status bar: progress bar resolution and width.
+constexpr int kJobProgressSteps = 1000;
+constexpr int kJobProgressWidth = 140;
+// Highlight after a job was queued, and how long the outcome stays after the queue went idle.
+constexpr int kJobFlashMs       = 1000;
+constexpr int kJobDoneVisibleMs = 4000;
 
-bool pathEquals(const QString &a, const QString &b)
+/// @brief Tab title for @p path: the folder name, or the path itself for a root like "C:/".
+QString tabLabel(const QString &path)
 {
-    return QString::compare(a, b, kPathCase) == 0;
+    const QString dirName = QDir(path).dirName();
+    return dirName.isEmpty() ? path : dirName;
 }
 
-bool pathStartsWith(const QString &path, const QString &prefix)
+/// @return Every FilePanel tab in @p tabs.
+QList<FilePanel *> panelsIn(const QTabWidget *tabs)
 {
-    return path.startsWith(prefix, kPathCase);
+    QList<FilePanel *> panels;
+    for (int i = 0; i < tabs->count(); ++i) {
+        if (auto *panel = qobject_cast<FilePanel *>(tabs->widget(i)))
+            panels << panel;
+    }
+    return panels;
 }
 
 /// @brief Build a display string for confirmation dialogs (up to @p maxShown names).
@@ -58,7 +71,7 @@ QString formatFileNamesText(const QStringList &paths, int maxShown = 5)
 
     QString text = names.mid(0, maxShown).join("\n");
     if (paths.size() > maxShown)
-        text += QString("\n… and %1 more").arg(paths.size() - maxShown);
+        text += "\n" + QObject::tr("… and %1 more").arg(paths.size() - maxShown);
     return text;
 }
 }
@@ -80,6 +93,9 @@ MainWindow::MainWindow(QWidget *parent)
 
 MainWindow::~MainWindow()
 {
+    // Panels before m_folderSizeCache — child objects die in creation order,
+    // and the cache was created first.
+    delete m_splitter;
     delete ui;
 }
 
@@ -91,7 +107,7 @@ void MainWindow::setupPanels()
     initTabWidget(m_leftTabs);
     initTabWidget(m_rightTabs);
 
-    addTab(m_leftTabs,  QDir::homePath());
+    FilePanel *leftPanel = addTab(m_leftTabs, QDir::homePath());
     addTab(m_rightTabs, QDir::homePath());
 
     m_splitter = new QSplitter(Qt::Horizontal, this);
@@ -100,6 +116,10 @@ void MainWindow::setupPanels()
     m_splitter->setSizes({600, 600});
 
     setCentralWidget(m_splitter);
+
+    // Start with the left panel focused (window not shown yet — Qt keeps
+    // this as the focus widget and applies it on activation).
+    leftPanel->setFocus();
 }
 
 void MainWindow::connectPanel(FilePanel *panel, QTabWidget *side)
@@ -112,9 +132,7 @@ void MainWindow::connectPanel(FilePanel *panel, QTabWidget *side)
         const int idx = side->indexOf(panel);
         if (idx < 0) return;
 
-        QString dirName = QDir(path).dirName();
-        if (dirName.isEmpty()) dirName = path;
-        side->setTabText(idx, dirName);
+        side->setTabText(idx, tabLabel(path));
         side->setTabToolTip(idx, QDir::toNativeSeparators(path));
     });
 
@@ -122,15 +140,27 @@ void MainWindow::connectPanel(FilePanel *panel, QTabWidget *side)
         addTab(side, path);
     });
 
-    // The shared drive watcher in MainWindow tells every panel when mounted
-    // volumes change — panels never run their own QStorageInfo poll.
-    connect(this, &MainWindow::driveTopologyChanged,
-            panel, &FilePanel::onDriveTopologyChanged);
+    // The shared drive scan in MainWindow feeds every panel — panels never
+    // query drives themselves. Opening a dropdown requests a probing rescan.
+    connect(this, &MainWindow::drivesChanged,
+            panel, &FilePanel::setDrives);
+    connect(panel, &FilePanel::driveScanRequested, this, [this]{
+        requestDriveScan(/*probeNetwork=*/true);
+    });
+    panel->setDrives(m_drives);
+
+    connect(panel, &FilePanel::networkSearchRequested,
+            m_networkDiscovery, &NetworkDiscovery::start);
+    connect(panel, &FilePanel::networkSharesFound,
+            this,  &MainWindow::onSharesFound);
+    connect(m_networkDiscovery, &NetworkDiscovery::runningChanged,
+            panel, &FilePanel::setNetworkSearchRunning);
+    panel->setNetworkSearchRunning(m_networkDiscovery->isRunning());
 }
 
 void MainWindow::createActions()
 {
-    m_newTabAction = new QAction("New &Tab", this);
+    m_newTabAction = new QAction(tr("New &Tab"), this);
     m_newTabAction->setShortcut(Qt::CTRL | Qt::Key_T);
     connect(m_newTabAction, &QAction::triggered, this, [this]{
         QTabWidget *side = activeSide();
@@ -139,38 +169,50 @@ void MainWindow::createActions()
         panel->setFocus();
     });
 
-    m_closeTabAction = new QAction("&Close Tab", this);
+    m_closeTabAction = new QAction(tr("&Close Tab"), this);
     m_closeTabAction->setShortcut(Qt::CTRL | Qt::Key_W);
     connect(m_closeTabAction, &QAction::triggered, this, [this]{
         QTabWidget *side = activeSide();
         closeTab(side, side->currentIndex());
     });
 
-    m_copyAction = new QAction(QIcon::fromTheme("document-copy"), "F5 Copy", this);
+    m_copyAction = new QAction(QIcon::fromTheme("document-copy"), tr("F5 Copy"), this);
     m_copyAction->setShortcut(Qt::Key_F5);
     connect(m_copyAction, &QAction::triggered, this, &MainWindow::onCopyRequested);
 
-    m_moveAction = new QAction(QIcon::fromTheme("go-jump"), "F6 Move", this);
+    m_moveAction = new QAction(QIcon::fromTheme("go-jump"), tr("F6 Move"), this);
     m_moveAction->setShortcut(Qt::Key_F6);
     connect(m_moveAction, &QAction::triggered, this, &MainWindow::onMoveRequested);
 
-    m_newFolderAction = new QAction(QIcon::fromTheme("folder-new"), "F7 New Folder", this);
+    m_newFolderAction = new QAction(QIcon::fromTheme("folder-new"), tr("F7 New Folder"), this);
     m_newFolderAction->setShortcut(Qt::Key_F7);
     connect(m_newFolderAction, &QAction::triggered, this, &MainWindow::onNewFolderRequested);
 
-    m_deleteAction = new QAction(QIcon::fromTheme("edit-delete"), "F8 Delete", this);
+    m_deleteAction = new QAction(QIcon::fromTheme("edit-delete"), tr("F8 Delete"), this);
     m_deleteAction->setShortcut(Qt::Key_F8);
     connect(m_deleteAction, &QAction::triggered, this, &MainWindow::onDeleteRequested);
 
-    m_refreshAction = new QAction(QIcon::fromTheme("view-refresh"), "F2 Refresh", this);
+    m_refreshAction = new QAction(QIcon::fromTheme("view-refresh"), tr("F2 Refresh"), this);
     m_refreshAction->setShortcut(Qt::Key_F2);
     connect(m_refreshAction, &QAction::triggered, this, &MainWindow::onRefreshRequested);
 
-    m_jobQueueAction = new QAction(QIcon::fromTheme("system-run"), "Job Queue", this);
-    connect(m_jobQueueAction, &QAction::triggered, this, [this]{
-        m_jobQueue->show();
-        m_jobQueue->raise();
+    m_jobQueueAction = new QAction(QIcon::fromTheme("system-run"), tr("Job Queue"), this);
+    connect(m_jobQueueAction, &QAction::triggered, m_jobQueue, &JobQueueWidget::showRestored);
+
+    // Also usable with an empty queue — jobs added while paused wait for Resume.
+    m_pauseQueueAction = new QAction(this);
+    connect(m_pauseQueueAction, &QAction::triggered, this, [this]{
+        m_jobQueue->setQueuePaused(!m_worker->isGlobalPaused());
     });
+    updatePauseQueueAction(m_worker->isGlobalPaused());
+
+    m_hidePartFilesAction = new QAction(tr("Hide .&part Files"), this);
+    m_hidePartFilesAction->setCheckable(true);
+    // On by default — set before the connect, the panels do not exist yet (addTab() applies it).
+    m_hidePartFilesAction->setChecked(m_hidePartFiles);
+    m_hidePartFilesAction->setToolTip(tr("Hide unfinished downloads (*.part) — copy and move leave them out"));
+    connect(m_hidePartFilesAction, &QAction::toggled,
+            this, &MainWindow::onToggleHidePartFiles);
 }
 
 void MainWindow::initTabWidget(QTabWidget *tabs)
@@ -188,16 +230,6 @@ void MainWindow::initTabWidget(QTabWidget *tabs)
         "}"
         );
 
-    auto *newTabBtn = new QToolButton(tabs);
-    newTabBtn->setText("+");
-    newTabBtn->setToolTip("New Tab (Ctrl+T)");
-    newTabBtn->setAutoRaise(true);
-    tabs->setCornerWidget(newTabBtn, Qt::TopRightCorner);
-
-    connect(newTabBtn, &QToolButton::clicked, this, [this, tabs]{
-        addTab(tabs);
-    });
-
     connect(tabs, &QTabWidget::tabCloseRequested, this, [this, tabs](int index){
         closeTab(tabs, index);
     });
@@ -205,18 +237,17 @@ void MainWindow::initTabWidget(QTabWidget *tabs)
 
 FilePanel *MainWindow::addTab(QTabWidget *side, const QString &path)
 {
-    QString startPath = path;
-    if (startPath.isEmpty())
-        startPath = QDir::homePath();
+    const QString startPath = path.isEmpty() ? QDir::homePath() : path;
 
-    auto *panel = new FilePanel(startPath, side);
+    auto *panel = new FilePanel(startPath, m_folderSizeCache, side);
     connectPanel(panel, side);
+    // Same view as the existing tabs — the defaults need no call (and no refresh).
+    if (m_showHiddenFiles)
+        panel->setShowHiddenFiles(true);
+    if (m_hidePartFiles)
+        panel->setHidePartFiles(true);
 
-    QString label = QDir(startPath).dirName();
-    if (label.isEmpty())
-        label = startPath;   // root dirs like "C:/" have no dirName
-
-    const int idx = side->addTab(panel, label);
+    const int idx = side->addTab(panel, tabLabel(startPath));
     side->setTabToolTip(idx, QDir::toNativeSeparators(startPath));
 
     // Single tab: hide close button so the user can't close the last tab.
@@ -251,7 +282,7 @@ void MainWindow::closeTab(QTabWidget *side, int index)
 
 void MainWindow::setupToolBar()
 {
-    QToolBar *bar = addToolBar("Main");
+    QToolBar *bar = addToolBar(tr("Main"));
     bar->setMovable(false);
 
     bar->addAction(m_copyAction);
@@ -261,52 +292,56 @@ void MainWindow::setupToolBar()
     bar->addSeparator();
     bar->addAction(m_refreshAction);
     bar->addSeparator();
+
     bar->addAction(m_jobQueueAction);
+    bar->addAction(m_pauseQueueAction);
 }
 
 void MainWindow::setupMenuBar()
 {
-    QMenu *fileMenu = ui->menubar->addMenu("&File");
+    QMenu *fileMenu = ui->menubar->addMenu(tr("&File"));
     fileMenu->addAction(m_newTabAction);
     fileMenu->addAction(m_closeTabAction);
     fileMenu->addSeparator();
     fileMenu->addAction(m_newFolderAction);
     fileMenu->addSeparator();
-    fileMenu->addAction("&Quit\tAlt+F4", qApp, &QApplication::quit);
+    // close(), not qApp->quit() — goes through closeEvent() and its running-jobs warning.
+    fileMenu->addAction(tr("&Quit\tAlt+F4"), this, &QWidget::close);
 
-    QMenu *viewMenu = ui->menubar->addMenu("&View");
+    QMenu *viewMenu = ui->menubar->addMenu(tr("&View"));
     viewMenu->addAction(m_refreshAction);
 
-    QAction *hiddenAct = viewMenu->addAction("Show &Hidden Files");
+    QAction *hiddenAct = viewMenu->addAction(tr("Show &Hidden Files"));
     hiddenAct->setCheckable(true);
     connect(hiddenAct, &QAction::toggled,
             this, &MainWindow::onToggleHiddenFiles);
+    viewMenu->addAction(m_hidePartFilesAction);
 
-    viewMenu->addSeparator();
-    viewMenu->addAction(m_jobQueueAction);
-
-    QMenu *helpMenu = ui->menubar->addMenu("&Help");
-    helpMenu->addAction("&About", this, [this]{
-        QMessageBox::about(this, "About NexusCommander",
-                           "<h2>NexusCommander</h2>"
-                           "<p>Version 1.0.0</p>"
-                           "<p>A fast, dual-pane file manager for Windows,<br>"
-                           "inspired by Total Commander.</p>"
-                           "<p>Licensed under the "
-                           R"(<a href="https://github.com/Kmorkel/NexusCommander/blob/main/LICENSE">MIT License</a>)"
-                           "<p><b>Shortcuts:</b><br>"
-                           "F2 Refresh<br>"
-                           "F5 Copy &nbsp; F6 Move<br>"
-                           "F7 New Folder &nbsp; F8 Delete<br>"
-                           "Ctrl+T New Tab &nbsp; Ctrl+W Close Tab</p>"
-                           "<hr>"
-                           "<p><b>Third-Party Software</b></p>"
-                           "<p>This application uses the <a href=\"https://www.qt.io/\">Qt Framework</a> "
-                           "(version " QT_VERSION_STR "), licensed under the "
-                           "<a href=\"https://www.gnu.org/licenses/lgpl-3.0.html\">LGPL v3</a>. "
-                           "Qt is linked dynamically; no modifications were made to the Qt source code.</p>"
-                           "<p>Qt source code is available at "
-                           "<a href=\"https://www.qt.io/download-open-source\">qt.io/download-open-source</a>.</p>");
+    QMenu *helpMenu = ui->menubar->addMenu(tr("&Help"));
+    helpMenu->addAction(tr("&About"), this, [this]{
+        QMessageBox::about(this, tr("About NexusCommander"),
+                           tr("<h2>NexusCommander</h2>"
+                              "<p>Version %1</p>"
+                              "<p>A fast, dual-pane file manager for Windows,<br>"
+                              "inspired by Total Commander.</p>"
+                              "<p>Licensed under the "
+                              R"(<a href="https://github.com/Kmorkel/NexusCommander/blob/main/LICENSE">MIT License</a>)"
+                              "<p><b>Shortcuts:</b><br>"
+                              "F2 Refresh<br>"
+                              "F5 Copy &nbsp; F6 Move<br>"
+                              "F7 New Folder &nbsp; F8 Delete<br>"
+                              "Ctrl+T New Tab &nbsp; Ctrl+W Close Tab<br>"
+                              "Ctrl+S Filter &nbsp; Tab Switch Panel</p>"
+                              "<hr>"
+                              "<p><b>Third-Party Software</b></p>"
+                              "<p>This application uses the <a href=\"https://www.qt.io/\">Qt Framework</a> "
+                              "(version %2), licensed under the "
+                              "<a href=\"https://www.gnu.org/licenses/lgpl-3.0.html\">LGPL v3</a>. "
+                              "Qt is linked dynamically; no modifications were made to the Qt source code.</p>"
+                              "<p>Qt source code is available at "
+                              "<a href=\"https://www.qt.io/download-open-source\">qt.io/download-open-source</a>.</p>")
+                               .arg(QApplication::applicationVersion(),
+                                    QLatin1String(qVersion())));
     });
 }
 
@@ -314,17 +349,111 @@ void MainWindow::setupStatusBar()
 {
     m_statusLabel = new QLabel("", this);
     ui->statusbar->addWidget(m_statusLabel, 1);
+
+    // Running jobs stay visible when the Job Queue window is closed — a click reopens it.
+    m_jobStatusButton = new QToolButton(this);
+    m_jobStatusButton->setAutoRaise(true);
+    m_jobStatusButton->setFocusPolicy(Qt::NoFocus);
+    m_jobStatusButton->setToolTip(tr("Show Job Queue"));
+    // Icon: reads as a button, not as plain status text.
+    m_jobStatusButton->setIcon(m_jobQueueAction->icon());
+    m_jobStatusButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    connect(m_jobStatusButton, &QToolButton::clicked, m_jobQueue, &JobQueueWidget::showRestored);
+
+    m_jobFlashTimer = new QTimer(this);
+    m_jobFlashTimer->setSingleShot(true);
+    m_jobFlashTimer->setInterval(kJobFlashMs);
+    connect(m_jobFlashTimer, &QTimer::timeout, this, [this]{ m_jobStatusButton->setStyleSheet({}); });
+
+    m_jobDoneTimer = new QTimer(this);
+    m_jobDoneTimer->setSingleShot(true);
+    m_jobDoneTimer->setInterval(kJobDoneVisibleMs);
+    connect(m_jobDoneTimer, &QTimer::timeout, m_jobStatusButton, &QWidget::hide);
+
+    m_jobProgressBar = new QProgressBar(this);
+    m_jobProgressBar->setRange(0, kJobProgressSteps);
+    m_jobProgressBar->setFixedWidth(kJobProgressWidth);
+    m_jobProgressBar->setTextVisible(false);
+
+    ui->statusbar->addPermanentWidget(m_jobStatusButton);
+    ui->statusbar->addPermanentWidget(m_jobProgressBar);
+    m_jobStatusButton->hide();
+    m_jobProgressBar->hide();
 }
 
 void MainWindow::setupDriveWatcher()
 {
+    m_driveScanWatcher = new QFutureWatcher<QList<DriveInfo>>(this);
+    connect(m_driveScanWatcher, &QFutureWatcher<QList<DriveInfo>>::finished,
+            this,               &MainWindow::onDriveScanFinished);
+
     m_driveWatchTimer = new QTimer(this);
     m_driveWatchTimer->setInterval(kDriveWatchIntervalMs);
 
-    connect(m_driveWatchTimer, &QTimer::timeout,
-            this,              &MainWindow::pollMountedDrives);
+    // Network drives are not probed here — only when a dropdown is opened.
+    connect(m_driveWatchTimer, &QTimer::timeout, this, [this]{
+        requestDriveScan(/*probeNetwork=*/false);
+    });
 
     m_driveWatchTimer->start();
+    requestDriveScan(/*probeNetwork=*/false);   // initial fill of all dropdowns
+}
+
+void MainWindow::requestDriveScan(bool probeNetwork)
+{
+    if (m_driveScanWatcher->isRunning()) {
+        // WM_DEVICECHANGE fires several times per plug-in, and a network probe
+        // can take seconds — collapse everything into one follow-up scan.
+        m_driveScanQueued      = true;
+        m_driveScanQueuedProbe = m_driveScanQueuedProbe || probeNetwork;
+        return;
+    }
+
+    m_driveScanWatcher->setFuture(QtConcurrent::run(&DriveScanner::scan, probeNetwork, m_knownShares));
+}
+
+void MainWindow::onSharesFound(const QStringList &uncPaths)
+{
+    bool changed = false;
+    for (const QString &path : uncPaths) {
+        if (!m_knownShares.contains(path, Qt::CaseInsensitive))
+            m_knownShares << path;
+        // Shown right away as Ready — the share list was just read from the server.
+        changed |= DriveScanner::upsertNetworkShare(m_drives, path, DriveInfo::State::Ready);
+    }
+
+    if (changed)
+        emit drivesChanged(m_drives);
+}
+
+void MainWindow::onDriveScanFinished()
+{
+    QList<DriveInfo> drives = m_driveScanWatcher->result();
+    // A scan started before onSharesFound() does not know the newest shares —
+    // add them back so they don't flicker out of the dropdown.
+    for (const QString &share : std::as_const(m_knownShares))
+        DriveScanner::upsertNetworkShare(drives, share, DriveInfo::State::Unknown);
+    DriveScanner::carryOverNetworkState(drives, m_drives);
+
+    const auto signatures = [](const QList<DriveInfo> &list) {
+        QStringList result;
+        for (const DriveInfo &drive : list)
+            result << drive.signature();
+        return result;
+    };
+
+    // Rebuilding every dropdown on each scan would reset an open popup for nothing.
+    const bool changed = signatures(drives) != signatures(m_drives);
+    m_drives = std::move(drives);
+    if (changed)
+        emit drivesChanged(m_drives);
+
+    if (m_driveScanQueued) {
+        const bool probe       = m_driveScanQueuedProbe;
+        m_driveScanQueued      = false;
+        m_driveScanQueuedProbe = false;
+        requestDriveScan(probe);
+    }
 }
 
 #ifdef _WIN32
@@ -332,10 +461,16 @@ bool MainWindow::nativeEvent(const QByteArray &eventType, void *message, qintptr
 {
     if (eventType == "windows_generic_MSG") {
         const MSG *msg = static_cast<const MSG *>(message);
+        // Sent when the taskbar button exists — again after an Explorer restart,
+        // which drops the progress shown on the old button.
+        static const UINT taskbarButtonCreated = RegisterWindowMessageW(L"TaskbarButtonCreated");
+        if (msg->message == taskbarButtonCreated && m_taskbarProgress)
+            m_taskbarProgress->reset();
+
         if (msg->message == WM_DEVICECHANGE &&
             (msg->wParam == DBT_DEVICEARRIVAL || msg->wParam == DBT_DEVICEREMOVECOMPLETE))
         {
-            pollMountedDrives();
+            requestDriveScan(/*probeNetwork=*/false);
         }
     }
     return QMainWindow::nativeEvent(eventType, message, result);
@@ -346,18 +481,44 @@ void MainWindow::setupCore()
 {
     m_worker = new FileWorkerThread(this);
     m_jobQueue = new JobQueueWidget(m_worker, this);
+
+    m_taskbarProgress = new TaskbarProgress(this);
+    connect(m_jobQueue,        &JobQueueWidget::taskbarProgressChanged,
+            m_taskbarProgress, &TaskbarProgress::setProgress);
+
+    // Created before the panels — every tab gets it in its constructor.
+    m_folderSizeCache = new FolderSizeCache(this);
+
+    // Created before the panels — connectPanel() wires every tab to it.
+    m_networkDiscovery = new NetworkDiscovery(this);
+    connect(m_networkDiscovery, &NetworkDiscovery::sharesFound,
+            this,               &MainWindow::onSharesFound);
+    connect(m_networkDiscovery, &NetworkDiscovery::runningChanged, this, [this](bool running){
+        // Search done: re-probe so shares known from an earlier search that
+        // did not answer this time turn grey.
+        if (!running)
+            requestDriveScan(/*probeNetwork=*/true);
+    });
 }
 
 void MainWindow::setupWindow()
 {
     resize(1200, 700);
-    setWindowTitle("NexusCommander");
+    setWindowTitle(QStringLiteral("NexusCommander"));
 }
 
 void MainWindow::setupConnections()
 {
     connect(m_worker, &FileWorkerThread::jobFinished,
             this,    &MainWindow::onJobFinished);
+    connect(m_jobQueue, &JobQueueWidget::activityChanged,
+            this,       &MainWindow::onJobActivityChanged);
+    connect(m_jobQueue, &JobQueueWidget::batchFinished,
+            this,       &MainWindow::onBatchFinished);
+    connect(m_jobQueue, &JobQueueWidget::jobAdded,
+            this,       &MainWindow::flashJobStatus);
+    connect(m_jobQueue, &JobQueueWidget::pauseChanged,
+            this,       &MainWindow::updatePauseQueueAction);
 
     connect(qApp, &QApplication::focusChanged,
             this, &MainWindow::onAppFocusChanged);
@@ -374,25 +535,10 @@ void MainWindow::setupUiComponents()
 
 QString MainWindow::findSourceContainingDest(const QStringList &sources, const QString &dest)
 {
-    const QString cleanDest = QDir::cleanPath(dest);
-
     for (const QString &path : sources) {
-        if (!QFileInfo(path).isDir())
-            continue;
-
-        const QString cleanSrc = QDir::cleanPath(path);
-
-        if (pathEquals(cleanDest, cleanSrc))
-            return cleanSrc;
-
-        // QDir::relativeFilePath normalizes separators and trailing slashes.
-        // If `dest` is outside `src`, the result starts with ".." (or is absolute).
-        // If it’s inside, it won’t start with ".." → valid match.
-        const QString rel = QDir(cleanSrc).relativeFilePath(cleanDest);
-        if (!rel.isEmpty() && !rel.startsWith(QLatin1String(".."))
-            && !QDir::isAbsolutePath(rel)) {
-            return cleanSrc;
-        }
+        // String check first — the stat runs on the GUI thread and a busy NAS answers after seconds.
+        if (isSameOrInside(dest, path) && QFileInfo(path).isDir())
+            return QDir::cleanPath(path);
     }
     return {};
 }
@@ -426,7 +572,9 @@ void MainWindow::enqueueTransferJob(FileJob::Type type)
     }
 
     const QString verb = type == FileJob::Type::Copy ? tr("copied") : tr("moved");
-    validateAndEnqueue(type, std::move(selected), dest, verb);
+    // Visible feedback that the job was queued: the cursor moves on, like Total Commander.
+    if (validateAndEnqueue(type, std::move(selected), dest, verb))
+        sourcePanel->advanceCursorPastSelection();
 }
 
 bool MainWindow::validateAndEnqueue(FileJob::Type type, QStringList sources,
@@ -455,6 +603,8 @@ bool MainWindow::validateAndEnqueue(FileJob::Type type, QStringList sources,
     job.type        = type;
     job.sources     = std::move(sources);
     job.destination = cleanDest;
+    // Fixed per job — toggling later does not change what a queued job copies.
+    job.skipPartFiles = m_hidePartFiles;
     m_worker->enqueue(job);
     m_jobQueue->addJob(job);
     return true;
@@ -463,26 +613,15 @@ bool MainWindow::validateAndEnqueue(FileJob::Type type, QStringList sources,
 void MainWindow::warnAndRemoveActiveJobConflicts(QStringList &selected,
                                                  const QString &operationVerb)
 {
-    const QStringList activeList = m_worker->activeSourcePaths();
+    const QStringList activeSources = m_worker->activeSourcePaths();
 
-    QVector<QString> activeNorm;
-    activeNorm.reserve(activeList.size());
-
-    for (const QString &p : activeList)
-        activeNorm.append( QDir::cleanPath(p));
-
-    const auto conflictsWithActive = [&](const QString &candidate) {
-        const QString normalized =  QDir::cleanPath(candidate);
-
-        for (const QString &active : activeNorm) {
-            if (pathEquals(active, normalized))
-                return true;                          // same path
-            if (pathStartsWith(active, normalized + '/'))
-                return true;                          // candidate is parent of an active source
-            if (pathStartsWith(normalized, active + '/'))
-                return true;                          // candidate is inside an active source
-        }
-        return false;
+    // Same path, a parent of an active source, or inside one.
+    const auto conflictsWithActive = [&activeSources](const QString &candidate) {
+        return std::any_of(activeSources.cbegin(), activeSources.cend(),
+                           [&candidate](const QString &active) {
+                               return isSameOrInside(active, candidate)
+                                      || isSameOrInside(candidate, active);
+                           });
     };
 
     QStringList conflictingNames;
@@ -566,27 +705,24 @@ bool MainWindow::handleMiddleClick(QObject *obj, QMouseEvent *event) {
     return true;
 }
 
-void MainWindow::refreshAffectedTabs(QTabWidget *side, const QStringList &affectedDirs)
+void MainWindow::refreshAffectedTabs(const QStringList &affectedDirs)
 {
-    // canonicalPath() ensures that paths pointing to the same folder are
-    // recognised as equal even if they differ in case, symlinks/junctions
-    // or path style. Resolved once into a QSet (which also dedups) so the
-    // loop below stays at O(N+M) filesystem calls instead of O(N*M).
-    QSet<QString> canonicalAffected;
-    for (const QString &dir : affectedDirs) {
-        const QString c = QDir(dir).canonicalPath();
-        if (!c.isEmpty())
-            canonicalAffected.insert(c);
-    }
+    // Compared as strings, without touching the filesystem — canonicalPath()
+    // stats every path on the GUI thread, which blocks on a slow or dead NAS
+    // after every job. Panels and jobs both use cleaned absolute paths.
+    QSet<QString> affected;
+    for (const QString &dir : affectedDirs)
+        affected.insert(pathKey(dir));
 
-    for (int i = 0; i < side->count(); ++i) {
-        auto *panel = qobject_cast<FilePanel*>(side->widget(i));
-        if (!panel) continue;
-
-        const QString panelCanon = QDir(panel->currentPath()).canonicalPath();
-        if (canonicalAffected.contains(panelCanon))
+    for (FilePanel *panel : allPanels()) {
+        if (affected.contains(pathKey(panel->currentPath())))
             panel->refresh();
     }
+}
+
+QList<FilePanel *> MainWindow::allPanels() const
+{
+    return panelsIn(m_leftTabs) + panelsIn(m_rightTabs);
 }
 
 QTabWidget *MainWindow::activeSide() const {
@@ -597,26 +733,7 @@ QTabWidget *MainWindow::activeSide() const {
 
 QTabWidget *MainWindow::inactiveSide() const
 {
-    if (activeSide() == m_leftTabs)
-        return m_rightTabs;
-    else
-        return m_leftTabs;
-}
-
-void MainWindow::refreshFilePanels(QTabWidget *tabs)
-{
-    for (int i = 0; i < tabs->count(); ++i) {
-        if (auto *panel = qobject_cast<FilePanel*>(tabs->widget(i)))
-            panel->refresh();
-    }
-}
-
-void MainWindow::setHiddenFilesVisibility(QTabWidget *tabs, bool visible)
-{
-    for (int i = 0; i < tabs->count(); ++i) {
-        if (auto *panel = qobject_cast<FilePanel*>(tabs->widget(i)))
-            panel->setShowHiddenFiles(visible);
-    }
+    return activeSide() == m_leftTabs ? m_rightTabs : m_leftTabs;
 }
 
 FilePanel *MainWindow::activePanel() const
@@ -647,14 +764,8 @@ void MainWindow::onAppFocusChanged(QWidget * /*old*/, QWidget *now)
     if (!focused)
         return;
 
-    const auto notify = [focused](QTabWidget *tabs) {
-        for (int i = 0; i < tabs->count(); ++i) {
-            if (auto *panel = qobject_cast<FilePanel *>(tabs->widget(i)))
-                panel->setActive(panel == focused);
-        }
-    };
-    notify(m_leftTabs);
-    notify(m_rightTabs);
+    for (FilePanel *panel : allPanels())
+        panel->setActive(panel == focused);
 }
 
 void MainWindow::onStatusUpdate(const QString &message)
@@ -703,14 +814,86 @@ void MainWindow::onNewFolderRequested()
 }
 void MainWindow::onRefreshRequested()
 {
-    refreshFilePanels(m_leftTabs);
-    refreshFilePanels(m_rightTabs);
+    for (FilePanel *panel : allPanels())
+        panel->refresh();
 }
 
 void MainWindow::onToggleHiddenFiles(bool visible)
 {
-    setHiddenFilesVisibility(m_leftTabs, visible);
-    setHiddenFilesVisibility(m_rightTabs, visible);
+    m_showHiddenFiles = visible;
+    for (FilePanel *panel : allPanels())
+        panel->setShowHiddenFiles(visible);
+}
+
+void MainWindow::onToggleHidePartFiles(bool hide)
+{
+    m_hidePartFiles = hide;
+    for (FilePanel *panel : allPanels())
+        panel->setHidePartFiles(hide);
+}
+
+void MainWindow::onJobActivityChanged(int activeJobs, TaskbarProgress::State state,
+                                      double fraction, const QString &remaining)
+{
+    const bool busy = activeJobs > 0;
+    m_jobProgressBar->setVisible(busy);
+    if (!busy) {
+        // A finished batch keeps its outcome on the button for a moment (onBatchFinished()).
+        if (!m_jobDoneTimer->isActive())
+            m_jobStatusButton->hide();
+        return;
+    }
+    m_jobDoneTimer->stop();
+    m_jobStatusButton->show();
+
+    const bool paused = state == TaskbarProgress::State::Paused;
+    QString text = paused ? tr("%n job(s) paused", nullptr, activeJobs)
+                          : tr("%n job(s) running", nullptr, activeJobs);
+    if (!paused && !remaining.isEmpty())
+        text += QStringLiteral("  —  ") + tr("%1 left").arg(remaining);
+    if (state == TaskbarProgress::State::Error)
+        text += QStringLiteral("  —  ") + tr("a job failed");
+
+    m_jobStatusButton->setText(text);
+    m_jobProgressBar->setValue(int(fraction * kJobProgressSteps));
+}
+
+void MainWindow::onBatchFinished(int doneJobs, bool failed)
+{
+    // Everything cancelled or skipped — nothing worth reporting.
+    if (doneJobs == 0 && !failed)
+        return;
+
+    m_jobStatusButton->setText(failed ? tr("⚠ A job failed — see Job Queue")
+                                      : tr("✓ %n job(s) done", nullptr, doneJobs));
+    m_jobStatusButton->show();
+    m_jobDoneTimer->start();
+}
+
+void MainWindow::flashJobStatus()
+{
+    m_jobStatusButton->setStyleSheet(QStringLiteral(
+        "QToolButton {"
+        "  background-color: palette(highlight);"
+        "  color: palette(highlighted-text);"
+        "  border-radius: 3px;"
+        "}"));
+    m_jobFlashTimer->start();
+}
+
+void MainWindow::updatePauseQueueAction(bool paused)
+{
+    if (paused) {
+        m_pauseQueueAction->setIcon(QIcon::fromTheme("media-playback-start",
+                                                     style()->standardIcon(QStyle::SP_MediaPlay)));
+        m_pauseQueueAction->setText(tr("Resume Queue"));
+        m_pauseQueueAction->setToolTip(tr("Queue paused — click to resume all jobs"));
+    } else {
+        m_pauseQueueAction->setIcon(QIcon::fromTheme("media-playback-pause",
+                                                     style()->standardIcon(QStyle::SP_MediaPause)));
+        m_pauseQueueAction->setText(tr("Pause Queue"));
+        m_pauseQueueAction->setToolTip(tr("Pause all running and queued jobs"));
+    }
 }
 
 void MainWindow::onPasteRequested(FilePanel *target)
@@ -757,7 +940,7 @@ void MainWindow::onPasteRequested(FilePanel *target)
         QApplication::clipboard()->clear();
 }
 
-void MainWindow::onJobFinished(QUuid jobId, FileJob::Status status, const QString &message)
+void MainWindow::onJobFinished(QUuid jobId)
 {
     const QStringList affected = m_jobQueue->affectedDirsForJob(jobId);
 
@@ -765,25 +948,36 @@ void MainWindow::onJobFinished(QUuid jobId, FileJob::Status status, const QStrin
         return;
     }
 
-    refreshAffectedTabs(m_leftTabs,  affected);
-    refreshAffectedTabs(m_rightTabs, affected);
+    // Also folders no tab is showing — their cached sizes (and their ancestors') are stale.
+    for (const QString &dir : affected)
+        m_folderSizeCache->invalidate(dir);
+
+    refreshAffectedTabs(affected);
 }
 
-void MainWindow::pollMountedDrives()
+void MainWindow::closeEvent(QCloseEvent *event)
 {
-    // Combine root path + volume label into a single signature so renaming
-    // a drive (without remount) also fires driveTopologyChanged().
-    QStringList currentSignatures;
+    const int activeJobs = m_jobQueue->activeJobCount();
+    if (activeJobs > 0) {
+        const auto reply = QMessageBox::warning(
+            this,
+            tr("Operations running"),
+            tr("%n file operation(s) still running or queued.\n\n"
+               "Quit anyway? They will be cancelled — the file being copied "
+               "right now is deleted, files already copied completely are kept.",
+               nullptr, activeJobs),
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::No);
 
-    for (const QStorageInfo &volume : QStorageInfo::mountedVolumes()) {
-        if (volume.isReady())
-            currentSignatures << volume.rootPath() + QLatin1Char('|') + volume.name();
+        if (reply == QMessageBox::No) {
+            event->ignore();
+            return;
+        }
     }
 
-    if (currentSignatures != m_lastDriveRoots) {
-        m_lastDriveRoots = std::move(currentSignatures);
-        emit driveTopologyChanged();
-    }
+    // ~FileWorkerThread cancels the jobs and waits — the copy guard then
+    // removes the partially written file.
+    event->accept();
 }
 
 bool MainWindow::eventFilter(QObject *obj, QEvent *event)

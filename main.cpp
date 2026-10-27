@@ -1,4 +1,5 @@
 #include <QApplication>
+#include <QIcon>
 #include <QLocale>
 #include <QTranslator>
 #include "mainwindow.h"
@@ -19,7 +20,9 @@ int main(int argc, char *argv[])
     }
 
     app.setApplicationName("NexusCommander");
-    app.setApplicationVersion("1.0.0");
+    app.setApplicationVersion(QStringLiteral(APP_VERSION));
+    // PNG, not the SVG: the SVG would need the QtSvg icon plugin
+    app.setWindowIcon(QIcon(":/icons/nexuscommander_256.png"));
 
     MainWindow w;
     w.show();

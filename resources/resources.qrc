@@ -1,0 +1,6 @@
+<RCC>
+    <qresource prefix="/icons">
+        <file>nexuscommander.svg</file>
+        <file>nexuscommander_256.png</file>
+    </qresource>
+</RCC>
