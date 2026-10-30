@@ -321,7 +321,8 @@ void MainWindow::setupMenuBar()
     helpMenu->addAction(tr("&About"), this, [this]{
         QMessageBox::about(this, tr("About NexusCommander"),
                            tr("<h2>NexusCommander</h2>"
-                              "<p>Version %1</p>"
+                              "<p>Version %1 &nbsp;&ndash;&nbsp; "
+                              R"(<a href="https://github.com/Kmorkel/NexusCommander/releases">Check for updates</a></p>)"
                               "<p>A fast, dual-pane file manager for Windows,<br>"
                               "inspired by Total Commander.</p>"
                               "<p>Licensed under the "

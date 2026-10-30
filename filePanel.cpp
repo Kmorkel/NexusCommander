@@ -26,12 +26,14 @@
 #include <QStyle>
 #include <QPushButton>
 #include <QFuture>
+#include <QHash>
 #include <QHeaderView>
 #include <QCollator>
 #include <QLocale>
 #include <QActionGroup>
 #include <QRegularExpression>
 #include <QtConcurrent/QtConcurrentRun>
+#include <QtGui/private/qfilesystemmodel_p.h>
 #include <algorithm>
 #include <filesystem>
 #include <functional>
@@ -122,6 +124,33 @@ struct ReachCheck {
     Reach                         reach       = Reach::Ok;
     NetworkDiscovery::ServerState serverState = NetworkDiscovery::ServerState::Reachable;  ///< Why ServerFailed.
 };
+
+// "//nas/media/…" → "nas".
+QString serverOf(const QString &uncPath)
+{
+    return uncShareRoot(uncPath).section('/', 2, 2);
+}
+
+// QFileSystemModel stats the server root ("\\nas") on the GUI thread the first
+// time a model shows a folder on that host. Qt answers that via NetShareEnum —
+// an RPC call to the server that took seconds every time ("Not Responding";
+// setting up the connection on the pool first did not help). So the root is
+// stat'ed on the pool once per session and handed to each model by
+// FilePanel::addServerNode(). GUI thread only. Key: pathKey() of the server name.
+QHash<QString, QFileInfo> &serverRoots()
+{
+    static QHash<QString, QFileInfo> roots;
+    return roots;
+}
+
+// Blocking — NetShareEnum. The server root of @p target with all its data
+// cached, so copies answer on the GUI thread without I/O.
+QFileInfo statServerRoot(const QString &target)
+{
+    QFileInfo info(QStringLiteral("//") + serverOf(target));
+    info.stat();
+    return info;
+}
 
 // Blocking — the first access to a share sets up the SMB session and can take
 // ~10 s (longer if the disk sleeps). That includes a mapped letter: Windows
@@ -931,6 +960,7 @@ void FilePanel::showFolder(const QString &path)
     // and removing the watch is an SMB round trip on the GUI thread, which blocked
     // for seconds while a copy kept the NAS busy. F2 and finished jobs refresh them.
     m_model->setOption(QFileSystemModel::DontWatchForChanges, isOnNetworkDrive(m_currentPath));
+    addServerNode(m_currentPath);
     m_model->setRootPath(m_currentPath);
     syncRootIndex();
 
@@ -1651,11 +1681,53 @@ void FilePanel::finishNetworkOpen(const QString &target, const QString &shareRoo
     // Keep the share in the dropdown for the session — a mapped letter is already there.
     if (isSharePath(target))
         emit networkSharesFound({shareRoot});
-    // Checked on the pool already — a second stat here would run on the GUI thread.
-    if (checked)
+    // Server root stat'ed once per session — see serverRoots().
+    const bool statServer = isSharePath(target) && !serverRoots().contains(pathKey(serverOf(target)));
+    if (checked && !statServer) {
         enterFolder(target);   // clears m_pendingNetworkPath
-    else
-        navigateTo(target);    // after a sign-in: the folder itself is still unchecked
+        return;
+    }
+
+    // After a sign-in the folder itself is still unchecked. That is the first
+    // access to the share (tree connect, disk may wake up) — on the GUI thread
+    // it froze the window ("Not Responding"). The path stays pending meanwhile.
+    QtConcurrent::run([target, checked, statServer] {
+        const bool isDir = checked || QFileInfo(target).isDir();
+        return std::make_pair(isDir, isDir && statServer ? statServerRoot(target) : QFileInfo());
+    })
+        .then(this, [this, target](const std::pair<bool, QFileInfo> &result) {
+            if (m_pendingNetworkPath != target)
+                return;   // user navigated elsewhere in the meantime
+            if (!result.first) {
+                abortNetworkOpen(tr("Path does not exist: %1").arg(QDir::toNativeSeparators(target)));
+                return;
+            }
+            if (!result.second.filePath().isEmpty())
+                serverRoots().insert(pathKey(serverOf(target)), result.second);
+            enterFolder(target);
+        });
+}
+
+void FilePanel::addServerNode(const QString &path)
+{
+    if (!isSharePath(path))
+        return;
+    const QString server = serverOf(path);
+    const auto known = serverRoots().constFind(pathKey(server));
+    if (known == serverRoots().cend())
+        return;   // never opened via openNetworkPath() — Qt stats it itself
+
+    // What QFileSystemModelPrivate::node() does for a new host, minus its stat
+    // and the volumeName() shell lookup (SHCreateItemFromParsingName on the
+    // server — network I/O as well). Children keys compare case-insensitively.
+    auto *d = static_cast<QFileSystemModelPrivate *>(QObjectPrivate::get(m_model));
+    const QString host = QStringLiteral("\\\\") + server;
+    if (d->root.children.contains(host))
+        return;
+    auto *node = new QFileSystemModelPrivate::QFileSystemNode(host, &d->root);
+    node->populate(*known);
+    d->root.children.insert(host, node);
+    d->addVisibleFiles(&d->root, {host});
 }
 
 void FilePanel::abortNetworkOpen(const QString &message)

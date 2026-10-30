@@ -1,5 +1,8 @@
-# NexusCommander
-A fast, multithreaded dual-pane file manager for Windows — inspired by Total Commander, built with Qt 6 and C++17
+<div align="center">
+  <img src="resources/nexuscommander_256.png" alt="NexusCommander icon" width="160" height="160">
+  <h1>NexusCommander</h1>
+  <p>A fast, multithreaded dual-pane file manager for Windows — inspired by Total Commander, built with Qt 6 and C++17</p>
+</div>
 
 ![NexusCommander](screenshots/nexuscommander.png)
 
@@ -47,12 +50,12 @@ Pre-built Windows binaries are available on the [Releases](../../releases) page 
 
 - **Windows 10 / 11** (uses Win32 APIs for drives, network shares and the taskbar)
 - **Qt 6.x** with the Widgets, Concurrent and Network modules (install via [qt.io/download-open-source](https://www.qt.io/download-open-source))
-- **CMake 3.16+**
+- **CMake 3.18+**
 - **C++17** compiler (MSVC or MinGW)
 
 ### Option 1 — Qt Creator
 
-Open `CMakeLists.txt` in Qt Creator, select your Kit, and build. Works with both MinGW and MSVC kits.
+Open `CMakeLists.txt` in Qt Creator, select your Kit, and build. Works with both MinGW and MSVC kits. This is the recommended way to build with MinGW — Qt Creator sets up the compiler and Qt for you.
 
 ### Option 2 — Visual Studio (MSVC)
 
@@ -73,37 +76,26 @@ cmake -B build -DCMAKE_PREFIX_PATH="D:/Qt/6.x.x/msvc2022_64"
 
 Or set the environment variable `QT_ROOT` or `QTDIR` before running CMake.
 
-### Option 3 — MinGW (command line)
-
-MinGW is auto-detected the same way (`C:\Qt\*\mingw*`):
-
-```bash
-cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-```
-
-Or pass the path explicitly:
-
-```bash
-cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="C:/Qt/6.x.x/mingw_64"
-```
-
 ### Deployment
 
 After a build, `CMakeLists.txt` runs `windeployqt` as a post-build step:
 
-- **MSVC** (Debug and Release) — the Qt DLLs are copied next to `NexusCommander.exe`, so it runs and debugs straight from Visual Studio.
-- **MinGW** (Release only) — a self-contained copy is assembled under `build/deploy/`:
+- **MSVC** (every configuration) — the Qt DLLs and plugins are copied next to `NexusCommander.exe`, so it runs and debugs straight from Visual Studio or Qt Creator:
+  - **Debug** gets the debug DLLs (`Qt6Cored.dll`, `Qt6Widgetsd.dll`, …) — a debug build cannot run or be debugged with the release DLLs.
+  - **Release / MinSizeRel / RelWithDebInfo** get the release DLLs (`Qt6Core.dll`, …).
+
+  The build folder also contains CMake files, and the Visual C++ runtime is only included as the `vc_redist.x64.exe` installer — so for distribution, use the MinGW `deploy/` folder below.
+- **MinGW** (every configuration except Debug) — a self-contained copy is assembled in a `deploy/` folder inside the build folder, including the MinGW runtime DLLs:
 
 ```
-build/deploy/
+<build folder>/deploy/
  ├── NexusCommander.exe
  ├── Qt6Core.dll, Qt6Gui.dll, Qt6Widgets.dll, Qt6Network.dll, ...
  ├── platforms/, styles/, imageformats/, ...
  └── libgcc_s_seh-1.dll, libstdc++-6.dll, libwinpthread-1.dll
 ```
 
-This folder runs on any Windows machine without a Qt installation — zip it up and ship it. MinGW Debug builds are not deployed; Qt Creator sets `PATH` itself when debugging.
+This folder runs on any Windows machine without a Qt installation — zip it up and ship it. MinGW Debug builds are not deployed (Qt's MinGW packages ship no debug plugins); Qt Creator sets `PATH` itself when debugging.
 
 ## Keyboard Shortcuts
 

@@ -230,6 +230,9 @@ private:
     /// @brief The network path is reachable — remember its share and navigate there.
     /// @p checked: the folder was already found on the pool, no second stat needed.
     void finishNetworkOpen(const QString &target, const QString &shareRoot, bool checked);
+    /// @brief Seed the model with the server node of @p path (UNC) from the
+    /// root stat'ed on the pool — else setRootPath() asks the server on the GUI thread.
+    void addServerNode(const QString &path);
     /// @brief Give up on the pending network path; an empty @p message shows no error.
     void abortNetworkOpen(const QString &message);
     /// @brief navigateTo(), but a network path goes through openNetworkPath() first.
