@@ -14,6 +14,7 @@
 #include <QMimeData>
 #include <QSortFilterProxyModel>
 #include <QApplication>
+#include <QSettings>
 #include <QShortcut>
 #include <QSignalBlocker>
 #include <QStandardItemModel>
@@ -72,7 +73,7 @@ constexpr int kRowsChangedDelayMs     = 100;
 // Marks the action entries at the end of the drive dropdown — Qt::UserRole holds the drive root.
 constexpr int kDriveActionRole     = Qt::UserRole + 1;
 enum class DriveAction { None, FindNetwork, ConnectServer };
-// Folder placement of a new tab — changeable per tab, never saved.
+// Folder placement of a new tab — changeable per tab, saved with the tab.
 constexpr FolderPlacement kDefaultFolderPlacement = FolderPlacement::Mixed;
 
 // UNC path or a mapped drive letter. GetDriveTypeW() asks the local redirector,
@@ -104,6 +105,49 @@ bool hasOwnShellIcon(const QFileInfo &info)
 QString exactBytes(qint64 bytes)
 {
     return QObject::tr("%1 bytes").arg(QLocale().toString(bytes));
+}
+
+// INI value of a folder placement — not translated, unlike folderPlacementText().
+// INI value of a list column — readable instead of the column number.
+constexpr std::pair<int, const char *> kColumnKeys[] = {
+    {kNameColumn, "name"}, {kSizeColumn, "size"}, {kTypeColumn, "type"}, {kDateColumn, "date"},
+};
+
+QString columnKey(int column)
+{
+    for (const auto &[index, key] : kColumnKeys) {
+        if (index == column)
+            return QLatin1String(key);
+    }
+    return QLatin1String("name");
+}
+
+// @return The column named @p key, or -1 if unknown.
+int columnFromKey(const QString &key)
+{
+    for (const auto &[index, columnName] : kColumnKeys) {
+        if (key == QLatin1String(columnName))
+            return index;
+    }
+    return -1;
+}
+
+QString folderPlacementKey(FolderPlacement placement)
+{
+    switch (placement) {
+    case FolderPlacement::Top:    return QStringLiteral("top");
+    case FolderPlacement::Bottom: return QStringLiteral("bottom");
+    case FolderPlacement::Mixed:  return QStringLiteral("mixed");
+    }
+    return {};
+}
+
+FolderPlacement folderPlacementFromKey(const QString &key)
+{
+    if (key == QLatin1String("top"))    return FolderPlacement::Top;
+    if (key == QLatin1String("bottom")) return FolderPlacement::Bottom;
+    if (key == QLatin1String("mixed"))  return FolderPlacement::Mixed;
+    return kDefaultFolderPlacement;
 }
 
 QString folderPlacementText(FolderPlacement placement)
@@ -190,12 +234,19 @@ ReachCheck checkNetworkPath(const QString &target, const QString &root,
 // Blocking — run it on the pool for network paths.
 QString existingFolderOrParent(const QString &path)
 {
-    QDir dir(path);
-    do {
-        if (QFileInfo(dir.absolutePath()).isDir())
-            return dir.absolutePath();
-    } while (dir.cdUp());
-    return {};
+    // Walked as strings — QDir::cdUp() stops at the first parent that is missing too.
+    QString candidate = QDir::cleanPath(QDir(path).absolutePath());
+    for (;;) {
+        if (QFileInfo(candidate).isDir())
+            return candidate;
+        // Not above the share — "\\server" alone is no folder.
+        if (isSharePath(candidate) && pathEquals(candidate, uncShareRoot(candidate)))
+            return {};
+        const QString parent = QFileInfo(candidate).absolutePath();
+        if (parent == candidate)
+            return {};   // drive root reached
+        candidate = parent;
+    }
 }
 }
 
@@ -1269,7 +1320,7 @@ void FilePanel::onContextMenuRequested(const QPoint &pos)
     menu.addSeparator();
     menu.addAction(QIcon::fromTheme("folder-new"),   tr("New Folder\tF7"), this, &FilePanel::createNewFolder);
     menu.addAction(QIcon::fromTheme("view-refresh"), tr("Refresh\tF2"),    this, &FilePanel::refresh);
-    menu.addAction(QIcon::fromTheme("utilities-terminal"), tr("Open Terminal Here"),
+    menu.addAction(QIcon::fromTheme("utilities-terminal"), tr("Open Terminal Here	F9"),
                    this, [this]{ openTerminal(m_currentPath); });
 
     menu.addSeparator();
@@ -1430,6 +1481,84 @@ void FilePanel::openTerminal(const QString &dir)
     if (!started)
         QMessageBox::warning(this, tr("Open Terminal"),
                              tr("Could not open a terminal in \"%1\".").arg(nativeDir));
+}
+
+void FilePanel::saveSettings(QSettings &settings) const
+{
+    // A network folder still being opened is where the user wants to be — a NAS
+    // that was offline at startup must not lose the tab's folder.
+    settings.setValue(QStringLiteral("Path"),
+                      m_pendingNetworkPath.isEmpty() ? m_currentPath : m_pendingNetworkPath);
+
+    const QHeaderView *header = m_fileView->header();
+    settings.setValue(QStringLiteral("SortColumn"), columnKey(header->sortIndicatorSection()));
+    settings.setValue(QStringLiteral("SortOrder"),
+                      header->sortIndicatorOrder() == Qt::DescendingOrder ? QStringLiteral("descending")
+                                                                          : QStringLiteral("ascending"));
+    settings.setValue(QStringLiteral("Folders"), folderPlacementKey(m_proxyModel->folderPlacement()));
+
+    // The Name column stretches — only the others have a width of their own.
+    QStringList widths;
+    for (const int column : {kSizeColumn, kTypeColumn, kDateColumn})
+        widths << QString::number(header->sectionSize(column));
+    settings.setValue(QStringLiteral("ColumnWidths"), widths);
+}
+
+void FilePanel::restoreSettings(const QSettings &settings)
+{
+    const int column = columnFromKey(settings.value(QStringLiteral("SortColumn")).toString());
+    const bool descending = settings.value(QStringLiteral("SortOrder")).toString() == QLatin1String("descending");
+    if (column >= 0)
+        m_fileView->sortByColumn(column, descending ? Qt::DescendingOrder : Qt::AscendingOrder);
+
+    setFolderPlacement(folderPlacementFromKey(settings.value(QStringLiteral("Folders")).toString()));
+
+    const QStringList widths = settings.value(QStringLiteral("ColumnWidths")).toStringList();
+    const int columns[] = {kSizeColumn, kTypeColumn, kDateColumn};
+    for (int i = 0; i < widths.size() && i < int(std::size(columns)); ++i) {
+        bool ok = false;
+        const int width = widths.at(i).toInt(&ok);
+        if (ok && width > 0)
+            m_fileView->header()->resizeSection(columns[i], width);
+    }
+
+    restoreFolder(settings.value(QStringLiteral("Path")).toString());
+}
+
+void FilePanel::restoreFolder(const QString &path)
+{
+    const QString cleanPath = QDir::cleanPath(QDir::fromNativeSeparators(path.trimmed()));
+    if (cleanPath.isEmpty() || pathEquals(cleanPath, m_currentPath))
+        return;
+
+    // Local folders are checked right away — the window is not shown yet.
+    if (!isOnNetworkDrive(cleanPath)) {
+        if (const QString existing = existingFolderOrParent(cleanPath); !existing.isEmpty())
+            showFolder(existing);
+        return;
+    }
+
+    // The NAS may be asleep or gone — a stat on the GUI thread would freeze the
+    // window for seconds. The tab shows its start folder until the check returns;
+    // navigating elsewhere first cancels the restore (clears m_pendingNetworkPath).
+    m_pendingNetworkPath = cleanPath;
+    emit statusMessage(tr("Connecting to %1…").arg(QDir::toNativeSeparators(cleanPath)));
+
+    QtConcurrent::run(&existingFolderOrParent, cleanPath)
+        .then(this, [this, cleanPath](const QString &existing) {
+            if (m_pendingNetworkPath != cleanPath)
+                return;   // user navigated elsewhere in the meantime
+            m_pendingNetworkPath.clear();
+            if (existing.isEmpty()) {
+                updateStatusBar();
+                return;
+            }
+
+            // Keep the share in the dropdown for the session, like finishNetworkOpen().
+            if (isSharePath(existing))
+                emit networkSharesFound({uncShareRoot(existing)});
+            showFolder(existing);
+        });
 }
 
 bool FilePanel::handleMiddleClickNavigation(QMouseEvent *mouseEvent)
@@ -2087,7 +2216,7 @@ void FilePanel::addFolderPlacementActions(QMenu *menu)
 
 void FilePanel::setFolderPlacement(FolderPlacement placement)
 {
-    // Per tab and per session only — the proxy belongs to this panel.
+    // Per tab — the proxy belongs to this panel; saved with the tab (saveSettings()).
     m_proxyModel->setFolderPlacement(placement);
     m_proxyModel->invalidate();
     m_placementButton->setText(folderPlacementText(placement));

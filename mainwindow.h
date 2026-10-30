@@ -16,6 +16,8 @@
 #include "networkDiscovery.h"
 #include "jobQueueWidget.h"
 
+class QSettings;
+
 QT_BEGIN_NAMESPACE
 namespace Ui { class MainWindow; }
 QT_END_NAMESPACE
@@ -25,9 +27,12 @@ QT_END_NAMESPACE
  *        one or more FilePanel tabs. Also owns the FileWorkerThread and JobQueueWidget.
  *
  * Provides a toolbar, menu bar, and F-key shortcuts for the core operations
- * (F2 Refresh, F5 Copy, F6 Move, F7 New Folder, F8 Delete). Copy/Move always
+ * (F2 Refresh, F5 Copy, F6 Move, F7 New Folder, F8 Delete, F9 Terminal). Copy/Move always
  * go from the active (focused) panel to the inactive panel. Clipboard paste
  * (Ctrl+V) targets whichever panel emitted the signal.
+ *
+ * Window place, tabs, their folders and view settings are saved to an INI file
+ * on close (settingsFilePath()) and restored on the next start.
  */
 
 class MainWindow : public QMainWindow
@@ -104,7 +109,7 @@ private:
     QTimer         *m_jobFlashTimer   = nullptr;   ///< Ends the highlight after a job was queued.
     QTimer         *m_jobDoneTimer    = nullptr;   ///< Hides the "✓ N job(s) done" summary.
 
-    // View settings for all tabs, also applied to new ones — per session, never saved.
+    // View settings for all tabs, also applied to new ones — saved in the INI file.
     bool            m_showHiddenFiles = false;
     bool            m_hidePartFiles   = true;    ///< On by default.
 
@@ -142,6 +147,8 @@ private:
     QAction *m_jobQueueAction  = nullptr;
     QAction *m_pauseQueueAction = nullptr;   ///< Pause / resume the whole queue — icon follows the state.
     QAction *m_hidePartFilesAction = nullptr;
+    QAction *m_showHiddenAction    = nullptr;
+    QAction *m_terminalAction  = nullptr;
 
     /// @return The panel (or child of) that currently has keyboard focus.
     FilePanel *activePanel()   const;
@@ -195,4 +202,18 @@ private:
     bool handleMiddleClick(QObject *obj, QMouseEvent *event);
     /// @brief Refresh every tab that shows one of @p affectedDirs.
     void refreshAffectedTabs(const QStringList &affectedDirs);
+
+    /// @return "%APPDATA%/NexusCommander/NexusCommander.ini".
+    static QString settingsFilePath();
+    /// @brief Save window place, view settings and all tabs (on close).
+    void saveSettings() const;
+    /// @brief Restore what saveSettings() wrote — called once before the window is shown.
+    void restoreSettings();
+    /// @brief Put the window back on the monitor it was closed on — if that monitor
+    /// is still connected; otherwise centred on the primary monitor.
+    void restoreWindowGeometry(const QSettings &settings);
+    /// @brief Write the tabs of @p side into @p group.
+    static void saveTabs(QSettings &settings, const QString &group, const QTabWidget *side);
+    /// @brief Rebuild the tabs of @p side from @p group — the start tab becomes the first one.
+    void restoreTabs(QSettings &settings, const QString &group, QTabWidget *side);
 };

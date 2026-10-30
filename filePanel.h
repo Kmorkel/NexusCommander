@@ -22,8 +22,9 @@
 #include "folderSizeCache.h"
 
 class QMenu;
+class QSettings;
 
-/// Where folders go in the sorted file list — chosen per tab, never saved.
+/// Where folders go in the sorted file list — chosen per tab, saved with the tab.
 enum class FolderPlacement { Top, Bottom, Mixed };
 
 /**
@@ -90,6 +91,15 @@ public:
     /// central focus listener — never wire this to qApp::focusChanged
     /// from inside the panel (would scale O(N) with the number of tabs).
     void setActive(bool active);
+
+    /// @brief Open a terminal window in @p dir (Windows Terminal, else PowerShell).
+    void openTerminal(const QString &dir);
+
+    /// @brief Write folder, sort order, column widths and folder placement of this
+    /// tab into the current group / array entry of @p settings.
+    void saveSettings(QSettings &settings) const;
+    /// @brief Restore what saveSettings() wrote. The folder goes through restoreFolder().
+    void restoreSettings(const QSettings &settings);
 
 signals:
     /// @brief Status bar text for MainWindow (e.g. "42 items | 3 selected | C:/…").
@@ -288,8 +298,10 @@ private:
     void setFolderPlacement(FolderPlacement placement);
     /// @brief Open a file with the OS default application.
     void openWithDefault(const QString &path);
-    /// @brief Open a terminal window in @p dir (Windows Terminal, else PowerShell).
-    void openTerminal(const QString &dir);
+    /// @brief Show a folder saved by the last session — no history entry, no error
+    /// message: a missing folder falls back to its nearest existing parent, else the
+    /// tab stays where it is. Network folders are checked off the GUI thread.
+    void restoreFolder(const QString &path);
     /// @brief Handle middle-click on a directory to open it in a new tab.
     bool handleMiddleClickNavigation(QMouseEvent *mouseEvent);
 };

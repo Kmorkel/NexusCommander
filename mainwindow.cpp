@@ -17,6 +17,9 @@
 #include <QGridLayout>
 #include <QSpacerItem>
 #include <QStyle>
+#include <QSettings>
+#include <QScreen>
+#include <QStandardPaths>
 #include <QtConcurrent/QtConcurrentRun>
 #include <algorithm>
 #include "clipboardUtils.h"
@@ -43,6 +46,10 @@ constexpr int kJobProgressWidth = 140;
 // Highlight after a job was queued, and how long the outcome stays after the queue went idle.
 constexpr int kJobFlashMs       = 1000;
 constexpr int kJobDoneVisibleMs = 4000;
+
+// A saved window place counts only if at least this much of it is on the monitor.
+constexpr int kMinVisibleWidth  = 100;
+constexpr int kMinVisibleHeight = 50;
 
 /// @brief Tab title for @p path: the folder name, or the path itself for a root like "C:/".
 QString tabLabel(const QString &path)
@@ -89,6 +96,7 @@ MainWindow::MainWindow(QWidget *parent)
     setupUiComponents();
     setupConnections();
     setupDriveWatcher();
+    restoreSettings();
 }
 
 MainWindow::~MainWindow()
@@ -176,11 +184,14 @@ void MainWindow::createActions()
         closeTab(side, side->currentIndex());
     });
 
-    m_copyAction = new QAction(QIcon::fromTheme("document-copy"), tr("F5 Copy"), this);
+    // ThemeIcon enum, not XDG names — Qt maps only these to Windows' Segoe Fluent
+    // Icons; an unknown name ("document-copy") silently gives no icon at all.
+    m_copyAction = new QAction(QIcon::fromTheme(QIcon::ThemeIcon::EditCopy), tr("F5 Copy"), this);
     m_copyAction->setShortcut(Qt::Key_F5);
     connect(m_copyAction, &QAction::triggered, this, &MainWindow::onCopyRequested);
 
-    m_moveAction = new QAction(QIcon::fromTheme("go-jump"), tr("F6 Move"), this);
+    // Scissors, like Cut in Explorer — Qt has no "move" icon.
+    m_moveAction = new QAction(QIcon::fromTheme(QIcon::ThemeIcon::EditCut), tr("F6 Move"), this);
     m_moveAction->setShortcut(Qt::Key_F6);
     connect(m_moveAction, &QAction::triggered, this, &MainWindow::onMoveRequested);
 
@@ -196,7 +207,8 @@ void MainWindow::createActions()
     m_refreshAction->setShortcut(Qt::Key_F2);
     connect(m_refreshAction, &QAction::triggered, this, &MainWindow::onRefreshRequested);
 
-    m_jobQueueAction = new QAction(QIcon::fromTheme("system-run"), tr("Job Queue"), this);
+    // Clock: jobs wait in the queue — also the status-bar button's icon, next to the time left.
+    m_jobQueueAction = new QAction(QIcon::fromTheme(QIcon::ThemeIcon::DocumentOpenRecent), tr("Job Queue"), this);
     connect(m_jobQueueAction, &QAction::triggered, m_jobQueue, &JobQueueWidget::showRestored);
 
     // Also usable with an empty queue — jobs added while paused wait for Resume.
@@ -205,6 +217,19 @@ void MainWindow::createActions()
         m_jobQueue->setQueuePaused(!m_worker->isGlobalPaused());
     });
     updatePauseQueueAction(m_worker->isGlobalPaused());
+
+    m_terminalAction = new QAction(QIcon::fromTheme("utilities-terminal"), tr("F9 Terminal"), this);
+    m_terminalAction->setShortcut(Qt::Key_F9);
+    m_terminalAction->setToolTip(tr("Open a terminal in the folder of the active panel"));
+    connect(m_terminalAction, &QAction::triggered, this, [this]{
+        if (FilePanel *panel = activePanel())
+            panel->openTerminal(panel->currentPath());
+    });
+
+    m_showHiddenAction = new QAction(tr("Show &Hidden Files"), this);
+    m_showHiddenAction->setCheckable(true);
+    connect(m_showHiddenAction, &QAction::toggled,
+            this, &MainWindow::onToggleHiddenFiles);
 
     m_hidePartFilesAction = new QAction(tr("Hide .&part Files"), this);
     m_hidePartFilesAction->setCheckable(true);
@@ -291,6 +316,7 @@ void MainWindow::setupToolBar()
     bar->addAction(m_deleteAction);
     bar->addSeparator();
     bar->addAction(m_refreshAction);
+    bar->addAction(m_terminalAction);
     bar->addSeparator();
 
     bar->addAction(m_jobQueueAction);
@@ -304,6 +330,7 @@ void MainWindow::setupMenuBar()
     fileMenu->addAction(m_closeTabAction);
     fileMenu->addSeparator();
     fileMenu->addAction(m_newFolderAction);
+    fileMenu->addAction(m_terminalAction);
     fileMenu->addSeparator();
     // close(), not qApp->quit() — goes through closeEvent() and its running-jobs warning.
     fileMenu->addAction(tr("&Quit\tAlt+F4"), this, &QWidget::close);
@@ -311,10 +338,7 @@ void MainWindow::setupMenuBar()
     QMenu *viewMenu = ui->menubar->addMenu(tr("&View"));
     viewMenu->addAction(m_refreshAction);
 
-    QAction *hiddenAct = viewMenu->addAction(tr("Show &Hidden Files"));
-    hiddenAct->setCheckable(true);
-    connect(hiddenAct, &QAction::toggled,
-            this, &MainWindow::onToggleHiddenFiles);
+    viewMenu->addAction(m_showHiddenAction);
     viewMenu->addAction(m_hidePartFilesAction);
 
     QMenu *helpMenu = ui->menubar->addMenu(tr("&Help"));
@@ -331,6 +355,7 @@ void MainWindow::setupMenuBar()
                               "F2 Refresh<br>"
                               "F5 Copy &nbsp; F6 Move<br>"
                               "F7 New Folder &nbsp; F8 Delete<br>"
+                              "F9 Terminal<br>"
                               "Ctrl+T New Tab &nbsp; Ctrl+W Close Tab<br>"
                               "Ctrl+S Filter &nbsp; Tab Switch Panel</p>"
                               "<hr>"
@@ -976,9 +1001,146 @@ void MainWindow::closeEvent(QCloseEvent *event)
         }
     }
 
+    saveSettings();
+
     // ~FileWorkerThread cancels the jobs and waits — the copy guard then
     // removes the partially written file.
     event->accept();
+}
+
+QString MainWindow::settingsFilePath()
+{
+    // Per user, always writable — next to the exe fails in Program Files and is
+    // shared by all users. Window place on a missing monitor and missing folders
+    // are checked on restore, so a roaming profile on another PC is fine.
+    return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+           + QStringLiteral("/NexusCommander.ini");
+}
+
+void MainWindow::saveSettings() const
+{
+    QSettings settings(settingsFilePath(), QSettings::IniFormat);
+
+    settings.beginGroup(QStringLiteral("Window"));
+    // Closed while maximized or minimized: the size to come back to is the normal one.
+    const bool maximized = windowState() & Qt::WindowMaximized;
+    const bool normal    = !(windowState() & (Qt::WindowMaximized | Qt::WindowMinimized));
+    settings.setValue(QStringLiteral("Geometry"), normal ? geometry() : normalGeometry());
+    settings.setValue(QStringLiteral("Maximized"), maximized);
+    settings.setValue(QStringLiteral("Screen"), screen()->name());
+    QStringList splitterSizes;
+    for (const int size : m_splitter->sizes())
+        splitterSizes << QString::number(size);
+    settings.setValue(QStringLiteral("Splitter"), splitterSizes);
+    settings.setValue(QStringLiteral("ActiveSide"),
+                      activeSide() == m_rightTabs ? QStringLiteral("right") : QStringLiteral("left"));
+    settings.endGroup();
+
+    settings.beginGroup(QStringLiteral("View"));
+    settings.setValue(QStringLiteral("ShowHiddenFiles"), m_showHiddenFiles);
+    settings.setValue(QStringLiteral("HidePartFiles"), m_hidePartFiles);
+    settings.endGroup();
+
+    saveTabs(settings, QStringLiteral("LeftPanel"),  m_leftTabs);
+    saveTabs(settings, QStringLiteral("RightPanel"), m_rightTabs);
+}
+
+void MainWindow::saveTabs(QSettings &settings, const QString &group, const QTabWidget *side)
+{
+    // Removed first — otherwise entries of closed tabs would stay in the file.
+    settings.remove(group);
+    settings.beginGroup(group);
+    settings.setValue(QStringLiteral("CurrentTab"), side->currentIndex());
+
+    const QList<FilePanel *> panels = panelsIn(side);
+    settings.beginWriteArray(QStringLiteral("Tabs"), int(panels.size()));
+    for (int i = 0; i < panels.size(); ++i) {
+        settings.setArrayIndex(i);
+        panels.at(i)->saveSettings(settings);
+    }
+    settings.endArray();
+    settings.endGroup();
+}
+
+void MainWindow::restoreSettings()
+{
+    QSettings settings(settingsFilePath(), QSettings::IniFormat);
+
+    // Before the tabs — addTab() gives every new tab the current view settings.
+    m_showHiddenAction->setChecked(
+        settings.value(QStringLiteral("View/ShowHiddenFiles"), m_showHiddenFiles).toBool());
+    m_hidePartFilesAction->setChecked(
+        settings.value(QStringLiteral("View/HidePartFiles"), m_hidePartFiles).toBool());
+
+    restoreTabs(settings, QStringLiteral("LeftPanel"),  m_leftTabs);
+    restoreTabs(settings, QStringLiteral("RightPanel"), m_rightTabs);
+
+    // Window size first — the splitter divides it.
+    restoreWindowGeometry(settings);
+
+    QList<int> splitterSizes;
+    const QStringList savedSizes = settings.value(QStringLiteral("Window/Splitter")).toStringList();
+    for (const QString &size : savedSizes)
+        splitterSizes << size.toInt();
+    if (splitterSizes.size() == 2 && splitterSizes.at(0) > 0 && splitterSizes.at(1) > 0)
+        m_splitter->setSizes(splitterSizes);
+
+    QTabWidget *side = settings.value(QStringLiteral("Window/ActiveSide")).toString() == QLatin1String("right")
+                           ? m_rightTabs : m_leftTabs;
+    side->currentWidget()->setFocus();
+}
+
+void MainWindow::restoreTabs(QSettings &settings, const QString &group, QTabWidget *side)
+{
+    settings.beginGroup(group);
+    const int count = settings.beginReadArray(QStringLiteral("Tabs"));
+    for (int i = 0; i < count; ++i) {
+        settings.setArrayIndex(i);
+        // setupPanels() created one start tab per side — it becomes the first saved tab.
+        auto *panel = i == 0 ? qobject_cast<FilePanel *>(side->widget(0)) : addTab(side);
+        if (panel)
+            panel->restoreSettings(settings);
+    }
+    settings.endArray();
+
+    const int current = settings.value(QStringLiteral("CurrentTab"), 0).toInt();
+    if (current >= 0 && current < side->count())
+        side->setCurrentIndex(current);
+    settings.endGroup();
+}
+
+void MainWindow::restoreWindowGeometry(const QSettings &settings)
+{
+    const QRect   saved      = settings.value(QStringLiteral("Window/Geometry")).toRect();
+    const QString screenName = settings.value(QStringLiteral("Window/Screen")).toString();
+    if (!saved.isValid())
+        return;   // first start — default size, Windows picks the place
+
+    // Back on the monitor the window was closed on — only if it is still connected
+    // and the place is still on it (resolution or arrangement may have changed).
+    QScreen *target = nullptr;
+    for (QScreen *screen : QGuiApplication::screens()) {
+        const QRect visible = screen->availableGeometry().intersected(saved);
+        if (screen->name() == screenName
+            && visible.width() >= kMinVisibleWidth && visible.height() >= kMinVisibleHeight) {
+            target = screen;
+            break;
+        }
+    }
+
+    if (target) {
+        setGeometry(saved);
+    } else {
+        // Monitor gone: same size, centred on the primary monitor.
+        const QRect available = QGuiApplication::primaryScreen()->availableGeometry();
+        QRect rect(QPoint(), saved.size().boundedTo(available.size()));
+        rect.moveCenter(available.center());
+        setGeometry(rect);
+    }
+
+    // show() in main() keeps the state — maximized on the monitor placed above.
+    if (settings.value(QStringLiteral("Window/Maximized")).toBool())
+        setWindowState(windowState() | Qt::WindowMaximized);
 }
 
 bool MainWindow::eventFilter(QObject *obj, QEvent *event)
